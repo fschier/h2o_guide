@@ -1,0 +1,279 @@
+---
+title: "people_analytics_classification_problem"
+author: "Felix"
+date: "2 2 2021"
+output: html_document
+---
+
+## Using H2o for Employee Turnover
+
+Source: https://www.business-science.io/business/2017/09/18/hr_employee_attrition.html
+
+```{r}
+#Using h2o on HR Data
+library(h2o)
+library(tidyverse) # data wrangling
+library(readxl) # read in dataset (if needed)
+library(tidymodels) # mainly for preprosessing with recipes package
+
+
+attrition <- read_xlsx("data/IBM_employee_attrition.xlsx")
+glimpse(attrition)
+
+attrition_clean <- attrition %>%
+  select(-c("Over18","Attrition")) %>%
+  rename(Attrition = Attrition_Chr) %>%
+  mutate(across(is.character, as.factor)) %>%
+  select(Attrition, everything()) %>%
+  mutate(Attrition = fct_relevel(Attrition, c("Yes", "No")))
+
+# For Tidymodels: creating dummy variables out of factors:
+# attrition_tidy <- attrition_clean %>%
+#   recipe(Attrition ~ .) %>%
+#   step_dummy(all_nominal()) %>%
+#   prep() %>%
+#   juice()
+# 
+# glimpse(attrition_tidy)
+
+write_csv(attrition_clean, file.path(getwd(), "data", "attrition_clean.csv"))
+
+```
+
+```{r}
+# h2o Workflow with Attrition Data
+localH2O = h2o.init() # same as just calling h2o.init()
+h2o.init()
+
+# File can be read from disk or R environment:
+# df_attrition <- h2o.importFile("data/attrition_clean.csv") read directly from file
+
+# read from R environment
+df_attrition <- as.h2o(attrition_clean)
+
+# Split the dataset
+
+split_h2o <- h2o.splitFrame(df_attrition, c(0.7, 0.15), seed = 1234 )
+
+train_h2o <- h2o.assign(split_h2o[[1]], "train" ) # 70%
+valid_h2o <- h2o.assign(split_h2o[[2]], "valid" ) # 15%
+test_h2o  <- h2o.assign(split_h2o[[3]], "test" )  # 15%
+
+# Specify Outcome Variable:
+y <- "Attrition"
+x <- setdiff(names(train_h2o), y)
+
+```
+
+Take a look at the data.
+```{r}
+h2o.describe(train_h2o)
+```
+
+Run automl and specify max runtime:
+
+```{r}
+aml <- h2o.automl(
+    x = x, # when x not provided, defaults to all column names except y
+    y = y,
+    training_frame    = train_h2o,
+    leaderboard_frame = valid_h2o,
+    max_runtime_secs  = 30,
+    project_name = "employee_attrition")
+```
+
+inspect model object and extract all models and leader (by best metric)
+
+```{r}
+# print the leaderboard
+print(aml@leaderboard)
+
+# Extract leader model
+automl_leader <- aml@leader
+print(automl_leader)
+
+# Leadermodel: Modeltype (later needed for LIME Package)
+class(automl_leader)
+```
+
+Use final model to predict on test data:
+
+```{r}
+pred <- h2o.predict(object = aml, newdata =  test_h2o)  # predict(aml, test) and h2o.predict(aml@leader, test) also work
+head(pred)
+
+predicted_values <- pred %>%
+   as.data.frame()
+
+# Data Wrangling on the predicted values
+
+test_performance <- test_h2o %>%
+    tibble::as_tibble() %>%
+    select(Attrition) %>%
+    add_column(pred = as.vector(pred$predict)) %>%
+    mutate_if(is.character, as.factor)
+
+#Data Frame
+test_performance
+
+#Table aka COnfusion Matrix
+confusion_matrix <- test_performance %>%
+    table() 
+
+
+# Classification Analysis with common metrics:
+
+tn <- confusion_matrix[1]
+tp <- confusion_matrix[4]
+fp <- confusion_matrix[3]
+fn <- confusion_matrix[2]
+
+accuracy <- (tp + tn) / (tp + tn + fp + fn)
+misclassification_rate <- 1 - accuracy
+recall <- tp / (tp + fn)
+precision <- tp / (tp + fp)
+null_error_rate <- tn / (tp + tn + fp + fn)
+
+tibble(
+    accuracy,
+    misclassification_rate,
+    recall,
+    precision,
+    null_error_rate
+) %>% 
+    transpose() 
+
+```
+
+
+Making Black Box Models explainable with LIME Package:
+```{r}
+library(lime)
+
+# Setup lime::model_type() function for h2o
+# model_type.H2OBinomialModel <- function(x, ...) {
+#     # Function tells lime() what model type we are dealing with
+#     # 'classification', 'regression', 'survival', 'clustering', 'multilabel', etc
+#     #
+#     # x is our h2o model
+#     
+#     return("classification")
+# }
+# 
+# # Setup lime::predict_model() function for h2o
+# predict_model.H2OBinomialModel <- function(x, newdata, type, ...) {
+#     # Function performs prediction and returns dataframe with Response
+#     #
+#     # x is h2o model
+#     # newdata is data frame
+#     # type is only setup for data frame
+#     
+#     pred <- h2o.predict(x, as.h2o(newdata))
+#     
+#     # return probs
+#     return(as.data.frame(pred[,-1]))
+#     
+# }
+
+# Test our predict_model() function
+predict_model(x = automl_leader, newdata = as.data.frame(test_h2o[,-1]), type = 'raw') %>%
+    tibble::as_tibble()
+```
+```{r}
+explainer <- lime::lime(
+    as.data.frame(train_h2o[,-1]), 
+    model          = automl_leader, 
+    bin_continuous = FALSE)
+
+explanation <- lime::explain(
+    as.data.frame(test_h2o[1:10,-1]), 
+    explainer    = explainer, 
+    n_labels     = 1, 
+    n_features   = 4,
+    kernel_width = 0.5)
+```
+
+```{r}
+plot_features(explanation) +
+    labs(title = "HR Predictive Analytics: LIME Feature Importance Visualization",
+         subtitle = "Hold Out (Test) Set, First 10 Cases Shown")
+
+explanation
+
+# Diving deeper into lime package and visualisation practices for models (h2o, caret, ...)
+# https://www.business-science.io/business/2018/06/25/lime-local-feature-interpretation.html
+plot_explanations(explanation)
+```
+
+Add more preprosessing (with recipes) and do the same analysis:
+
+```{r}
+# Same Analysis with data preprosessed before passing it into h2o
+attrition_clean %>% glimpse()
+
+recipe_obj <- attrition_clean %>%
+  recipe(formula = Attrition ~ .) %>%
+  step_rm(EmployeeNumber) %>%
+  step_zv(all_predictors()) %>%
+  step_center(all_numeric()) %>%
+  step_scale(all_numeric()) %>%
+  prep(data = attrition_clean)
+
+hr_data_bake_tbl <- bake(object = recipe_obj, new_data = attrition_clean) 
+
+# Make "Yes" as first lvl of Factor, aka what we want to predict
+hr_data_bake_tbl <- hr_data_bake_tbl %>%
+  mutate(Attrition = fct_relevel(Attrition, c("Yes", "No")))
+
+# h2o workflow
+
+hr_data_bake_h2o <- as.h2o(hr_data_bake_tbl)
+
+hr_data_split <- h2o.splitFrame(hr_data_bake_h2o, ratios = c(0.7, 0.3), seed = 1234)
+
+train_h2o <- h2o.assign(hr_data_split[[1]], "train" ) # 70%
+valid_h2o <- h2o.assign(hr_data_split[[2]], "valid" ) # 15%
+test_h2o  <- h2o.assign(hr_data_split[[3]], "test" )  # 15%
+
+# Run Model
+y <- "Attrition"
+x <- setdiff(names(train_h2o), y)
+
+automl_models_h2o <- h2o.automl(
+  x = x, 
+  y = y,
+  training_frame    = train_h2o,
+  validation_frame  = valid_h2o,
+  leaderboard_frame = test_h2o,
+  max_runtime_secs  = 30
+)
+
+#Leader and Leaderboard
+
+automl_leader <- automl_models_h2o@leader
+
+automl_models_h2o@leaderboard
+
+# Lime Package:
+explainer <- lime::lime(
+  as.data.frame(train_h2o[,-1]), 
+  model          = automl_leader, 
+  bin_continuous = FALSE
+)
+
+explanation <- lime::explain(
+  x              = as.data.frame(test_h2o[1:10,-1]), 
+  explainer      = explainer, 
+  n_labels       = 1, 
+  n_features     = 4,
+  n_permutations = 500,
+  kernel_width   = 1
+)
+
+explanation
+
+plot_features(explanation) +
+    labs(title = "HR Predictive Analytics: LIME Feature Importance Visualization",
+         subtitle = "Hold Out (Test) Set, First 10 Cases Shown")
+```
+
