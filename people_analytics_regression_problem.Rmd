@@ -5,3 +5,14 @@ date: "2 2 2021"
 output: html_document
 ---
 
+Applying h2o automl engine to a "simple" hr analytics problem
+
+Detailed h2o Regression guide: https://nbviewer.jupyter.org/github/woobe/useR2019_h2o_tutorial/blob/master/tutorial.html#agenda
+
+```{r}
+library(h2o)
+library(peopleanalyticsdata)
+
+h2o.init()
+```
+
